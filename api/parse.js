@@ -1,59 +1,49 @@
-const express = require('express');
+// Note: We still need to require the necessary modules and local helpers
 const parseReplay = require('fortnite-replay-parser');
-// NOTE: These files (./exports/handleEventEmitter, ./NetFieldExports, ./Classes) 
-// MUST be present in your project for the parser options below to work.
-const handleEventEmitter = require('./exports/handleEventEmitter');
-const NetFieldExports = require('./NetFieldExports');
-const customClasses = require('./Classes');
+const handleEventEmitter = require('../exports/handleEventEmitter');
+const NetFieldExports = require('../NetFieldExports');
+const customClasses = require('../Classes');
 
-// Railway requires listening on the PORT environment variable
-const PORT = process.env.PORT || 3000; 
-const app = express();
-
-// Middleware to parse incoming JSON bodies
-app.use(express.json()); 
-
-/**
- * 📢 Webhook Endpoint: POST /parse
- * Receives the job trigger from your main application.
- * Body expected: { fileUrl: 'secure_url_to_replay_file', callbackUrl: 'your_app_webhook_for_results' }
- */
-app.post('/parse', async (req, res) => {
+// The main export is the serverless function handler
+module.exports = async (req, res) => {
+    // Vercel serverless functions only accept POST for this type of operation
+    if (req.method !== 'POST') {
+        return res.status(405).send('Method Not Allowed. Use POST.');
+    }
+    
+    // Parse the JSON body from the request
     const { fileUrl, callbackUrl } = req.body;
 
     if (!fileUrl || !callbackUrl) {
         return res.status(400).send({ message: '❌ Missing fileUrl or callbackUrl in request body.' });
     }
 
-    // Crucial: Respond immediately (HTTP 202 Accepted) so the client doesn't time out.
+    // Crucial: Respond immediately (HTTP 202 Accepted) and run the long-running task.
     res.status(202).send({ message: '✅ Parsing job accepted and started asynchronously.' });
     
-    // Start the long-running process in the background.
+    // Start the core logic. Note: The serverless function will complete here, 
+    // but Node.js will continue to execute the background task.
     executeParsingJob(fileUrl, callbackUrl);
-});
+};
 
 /**
  * Core function to download, parse, extract specific stats, and callback results.
+ * This is the same logic as before, using fetch and the parser.
  */
 async function executeParsingJob(signedUrl, resultsWebhookUrl) {
     let replayBuffer;
 
     try {
-        // --- 1. Download the File using Node.js native fetch ---
-        console.log(`[JOB] Downloading file from: ${signedUrl}`);
+        // --- 1. Download the File ---
         const response = await fetch(signedUrl);
-
         if (!response.ok) {
             throw new Error(`Download failed. Status: ${response.status}`);
         }
-        
         const arrayBuffer = await response.arrayBuffer();
         replayBuffer = Buffer.from(arrayBuffer);
 
-        // --- 2. Parse the Replay Data with Custom Options ---
-        console.log(`[JOB] Starting parsing...`);
+        // --- 2. Parse the Replay Data ---
         const replay = await parseReplay(replayBuffer, {
-            // Options needed to enable custom NetFieldExports for reliable data
             handleEventEmitter,
             customNetFieldExports: NetFieldExports,
             onlyUseCustomNetFieldExports: true,
@@ -62,16 +52,13 @@ async function executeParsingJob(signedUrl, resultsWebhookUrl) {
 
         // --- 3. Extract Player Name, Kills, and Placement ---
         const playersData = replay.gameData?.players ?? [];
-        
         const playerStats = playersData
-            .filter(player => !player.bIsABot) // Filter out bots
+            .filter(player => !player.bIsABot) 
             .map(player => ({
                 player_name: player.PlayerNamePrivate ?? player.PlayerName ?? "Unknown Player",
                 kills: player.KillScore ?? player.Kills ?? 0,
                 placement: player.Place ?? player.Placement ?? 0
             }));
-
-        console.log(`[JOB] Parsing complete. Found ${playerStats.length} human player stats.`);
 
         // --- 4. Send Results via Webhook ---
         await fetch(resultsWebhookUrl, {
@@ -79,13 +66,11 @@ async function executeParsingJob(signedUrl, resultsWebhookUrl) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 status: 'success',
-                stats: playerStats 
+                stats: playerStats
             })
         });
         
     } catch (error) {
-        console.error('❌ [JOB] Fatal Error:', error.message);
-        
         // --- 4. Send Error Status via Webhook ---
         try {
             await fetch(resultsWebhookUrl, {
@@ -97,11 +82,7 @@ async function executeParsingJob(signedUrl, resultsWebhookUrl) {
                 })
             });
         } catch (webhookError) {
-             console.error('❌ [JOB] Failed to send error webhook:', webhookError.message);
+             console.error('❌ Failed to send error webhook:', webhookError.message);
         }
     }
 }
-
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
